@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
@@ -40,8 +42,16 @@ func main() {
 	}()
 
 	mux := http.NewServeMux()
-	// otelhttp.NewHandler otomatis membuat span untuk setiap request masuk
+
+	// Endpoint lama — checkout memanggil payment-service (demo distributed tracing)
 	mux.Handle("/checkout", otelhttp.NewHandler(http.HandlerFunc(handleCheckout), "GET /checkout"))
+
+	// Endpoint baru — masing-masing fokus mendemonstrasikan 1 golden signal
+	mux.Handle("/ping", otelhttp.NewHandler(http.HandlerFunc(handlePing), "GET /ping"))
+	mux.Handle("/slow", otelhttp.NewHandler(http.HandlerFunc(handleSlow), "GET /slow"))
+	mux.Handle("/error", otelhttp.NewHandler(http.HandlerFunc(handleError), "GET /error"))
+	mux.Handle("/echo", otelhttp.NewHandler(http.HandlerFunc(handleEcho), "POST /echo"))
+
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
@@ -65,17 +75,16 @@ func main() {
 	_ = server.Shutdown(shutdownCtx)
 }
 
+// handleCheckout: entry point lama, memanggil payment-service (distributed tracing demo)
 func handleCheckout(w http.ResponseWriter, r *http.Request) {
 	paymentURL := getenv("PAYMENT_SERVICE_URL", "http://localhost:8082") + "/process"
 
-	// NewRequestWithContext meneruskan span context ke HTTP client
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, paymentURL, nil)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// client.Do menyisipkan W3C Trace Context header secara otomatis
 	resp, err := client.Do(req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -86,6 +95,37 @@ func handleCheckout(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(resp.Body)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(body)
+}
+
+// handlePing: baseline normal traffic, demo golden signal RPS
+func handlePing(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintln(w, "pong")
+}
+
+// handleSlow: random delay, demo golden signal Latency (p50/p95/p99)
+func handleSlow(w http.ResponseWriter, r *http.Request) {
+	delayMs := 500 + rand.Intn(1000) // 500-1500ms
+	time.Sleep(time.Duration(delayMs) * time.Millisecond)
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "slow response after %dms\n", delayMs)
+}
+
+// handleError: selalu gagal, demo golden signal Error Rate
+func handleError(w http.ResponseWriter, r *http.Request) {
+	http.Error(w, "simulated error", http.StatusInternalServerError)
+}
+
+// handleEcho: POST dengan body, variasi traffic + demo tracing dengan payload
+func handleEcho(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+	w.WriteHeader(http.StatusOK)
+	w.Write(body)
 }
 
 // setupOTel menginisialisasi OpenTelemetry tracer dengan OTLP HTTP exporter ke SigNoz.
@@ -115,10 +155,9 @@ func setupOTel(ctx context.Context, serviceName string) (func(context.Context) e
 		sdktrace.WithSampler(sdktrace.AlwaysSample()),
 	)
 	otel.SetTracerProvider(tp)
-	// TraceContext propagator agar span context bisa dibaca oleh service lain via HTTP header
 	otel.SetTextMapPropagator(propagation.TraceContext{})
 
-	log.Printf("OTel → SigNoz: %s  service=%s", traceURL, serviceName)
+	log.Printf("OTel -> SigNoz: %s  service=%s", traceURL, serviceName)
 	return tp.Shutdown, nil
 }
 
